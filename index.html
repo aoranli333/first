@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>手势切水果 - Gesture Fruit Ninja</title>
+
+    <!-- 引入样式库 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- 核心库 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #1a1a1a; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #game-container { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
+
+        /* 摄像头画中画 */
+        #camera-pip {
+            position: absolute; bottom: 20px; right: 20px;
+            width: 240px; height: 180px;
+            border-radius: 12px; overflow: hidden;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            background: #000; z-index: 10;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            transform: scaleX(-1); /* 镜像显示 */
+        }
+        #pip-video { display: none; } /* 原始视频隐藏，只显示画了骨骼的Canvas */
+        #pip-canvas { width: 100%; height: 100%; object-fit: cover; }
+
+        /* UI 层 */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            z-index: 5; pointer-events: none;
+            display: flex; flex-direction: column; justify-content: space-between;
+        }
+        .hud-top { padding: 20px; display: flex; justify-content: space-between; font-size: 24px; color: white; text-shadow: 0 2px 4px black; }
+        .center-msg {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            text-align: center; color: white;
+            text-shadow: 0 0 10px rgba(0,0,0,0.8);
+            transition: opacity 0.3s;
+        }
+        h1 { font-size: 3rem; margin: 0; background: linear-gradient(to right, #ff00cc, #3333ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .blink { animation: blinker 1.5s linear infinite; }
+        @keyframes blinker { 50% { opacity: 0; } }
+
+        #loading {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; z-index: 20; color: #fff;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 加载遮罩 -->
+    <div id="loading">
+        <div class="text-2xl font-bold mb-4">正在初始化神经系统...</div>
+        <div class="text-sm text-gray-400">请授予摄像头权限</div>
+    </div>
+
+    <!-- 游戏主画布 -->
+    <div id="game-container"></div>
+
+    <!-- UI -->
+    <div id="ui-layer">
+        <div class="hud-top">
+            <div id="score-board">得分: 0</div>
+            <div id="lives-board">❤️ ❤️ ❤️</div>
+        </div>
+        <div id="game-msg" class="center-msg">
+            <h1 class="mb-4">手势切水果</h1>
+            <p class="text-xl blink">请举起食指，切开地球开始游戏</p>
+            <p class="text-sm mt-4 text-gray-300">💡 玩法：食指变刀，切西瓜🍉加分，切炸弹💣结束</p>
+        </div>
+    </div>
+
+    <!-- 摄像头 PIP -->
+    <div id="camera-pip">
+        <video id="pip-video" playsinline></video>
+        <canvas id="pip-canvas"></canvas>
+    </div>
+
+<script>
+/**
+ * 音效管理器 (Web Audio API)
+ * 生成程序化音效，无需外部 mp3
+ */
+class SoundManager {
+    constructor() {
+        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        this.masterGain = this.ctx.createGain();
+        this.masterGain.gain.value = 0.3;
+        this.masterGain.connect(this.ctx.destination);
+    }
+
+    playTone(freq, type, duration) {
+        if(this.ctx.state === 'suspended') this.ctx.resume();
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+        gain.gain.setValueAtTime(1, this.ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(this.masterGain);
+        osc.start();
+        osc.stop(this.ctx.currentTime + duration);
+    }
+
+    playSlice() {
+        // 高频噪声模拟切开声
+        this.playTone(800 + Math.random() * 400, 'sawtooth', 0.1);
+    }
+
+    playExplosion() {
+        // 低频模拟爆炸
+        this.playTone(100, 'square', 0.5);
+        this.playTone(50, 'sawtooth', 0.6);
+    }
+
+    playSwoosh() {
+        // 挥刀声
+        if(this.ctx.state === 'suspended') this.ctx.resume();
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.frequency.setValueAtTime(200, this.ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(600, this.ctx.currentTime + 0.2);
+        gain.gain.setValueAtTime(0.2, this.ctx.currentTime);
+        gain.gain.linearRampToValueAtTime(0, this.ctx.currentTime + 0.2);
+        osc.connect(gain);
+        gain.connect(this.masterGain);
+        osc.start();
+        osc.stop(this.ctx.currentTime + 0.2);
+    }
+
+    playStart() {
+        this.playTone(440, 'sine', 0.2);
+        setTimeout(() => this.playTone(554, 'sine', 0.2), 200);
+        setTimeout(() => this.playTone(659, 'sine', 0.4), 400);
+    }
+}
+
+/**
+ * 游戏配置与全局变量
+ */
+const CONFIG = {
+    gravity: -15,
+    zPlane: 0, // 游戏物体所在的 Z 平面
+    bladeLife: 0.2, // 刀光存活时间
+    spawnRate: 1.5, // 秒
+};
+
+let scene, camera, renderer;
+let handLandmarks = null;
+let gameObjects = [];
+let particles = [];
+let score = 0;
+let lives = 3;
+let gameState = 'MENU'; // MENU, PLAYING, GAMEOVER
+let bladeTrail = [];
+let soundManager;
+let lastSpawnTime = 0;
+
+// DOM
+const scoreEl = document.getElementById('score-board');
+const livesEl = document.getElementById('lives-board');
+const msgEl = document.getElementById('game-msg');
+
+/**
+ * 纹理生成器 (将 Emoji 转为 Texture)
+ */
+function createEmojiTexture(emoji, size = 128) {
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    ctx.font = `${size * 0.8}px serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(emoji, size / 2, size / 2 + size * 0.1);
+    const tex = new THREE.CanvasTexture(canvas);
+    return tex;
+}
+
+const textures = {
+    watermelon: createEmojiTexture('🍉'),
+    poop: createEmojiTexture('💩'),
+    bomb: createEmojiTexture('💣'),
+    explosion: createEmojiTexture('💥')
+};
+
+/**
+ * 游戏物体类
+ */
+class GameObject {
+    constructor(type) {
+        this.type = type; // 'watermelon', 'poop', 'bomb', 'earth'
+        this.active = true;
+        this.radius = 1.5;
+
+        // 几何体与材质
+        let geometry, material;
+
+        if (type === 'earth') {
+            geometry = new THREE.SphereGeometry(2, 16, 16);
+            material = new THREE.MeshPhongMaterial({
+                color: 0x2233ff,
+                wireframe: true,
+                emissive: 0x112244
+            });
+            this.mesh = new THREE.Mesh(geometry, material);
+            this.radius = 2;
+        } else {
+            geometry = new THREE.PlaneGeometry(3, 3);
+            material = new THREE.MeshBasicMaterial({
+                map: textures[type],
+                transparent: true,
+                side: THREE.DoubleSide
+            });
+            this.mesh = new THREE.Mesh(geometry, material);
+        }
+
+        // 初始物理状态
+        if (type === 'earth') {
+            this.mesh.position.set(0, 0, CONFIG.zPlane);
+            this.velocity = new THREE.Vector3(0, 0, 0);
+            this.rotVelocity = new THREE.Vector3(0, 0.02, 0);
+        } else {
+            // 从底部随机抛出
+            const x = (Math.random() - 0.5) * 15;
+            this.mesh.position.set(x, -12, CONFIG.zPlane);
+
+            // 向上的初速度，稍微向中心偏
+            const vx = -x * 0.1 + (Math.random() - 0.5) * 2;
+            const vy = 12 + Math.random() * 5;
+            this.velocity = new THREE.Vector3(vx, vy, 0);
+
+            this.rotVelocity = new THREE.Vector3(
+                Math.random() * 0.1,
+                Math.random() * 0.1,
+                Math.random() * 0.1
+            );
+        }
+
+        scene.add(this.mesh);
+    }
+
+    update(dt) {
+        if (!this.active) return;
+
+        // 旋转
+        this.mesh.rotation.x += this.rotVelocity.x;
+        this.mesh.rotation.y += this.rotVelocity.y;
+        this.mesh.rotation.z += this.rotVelocity.z;
+
+        // 移动 (地球不动)
+        if (this.type !== 'earth') {
+            this.velocity.y += CONFIG.gravity * dt;
+            this.mesh.position.addScaledVector(this.velocity, dt);
+
+            // 掉落移除
+            if (this.mesh.position.y < -15) {
+                this.remove();
+                if (this.type === 'watermelon' && gameState === 'PLAYING') {
+                    // 漏掉西瓜扣分逻辑可在此添加
+                }
+            }
+        }
+    }
+
+    remove() {
+        this.active = false;
+        scene.remove(this.mesh);
+        this.mesh.geometry.dispose();
+        this.mesh.material.dispose();
+    }
+
+    slice() {
+        this.remove();
+        createParticles(this.mesh.position, this.type);
+
+        if (this.type === 'watermelon' || this.type === 'poop') {
+            soundManager.playSlice();
+            score += (this.type === 'watermelon' ? 10 : 50);
+            updateUI();
+        } else if (this.type === 'bomb') {
+            soundManager.playExplosion();
+            endGame();
+        } else if (this.type === 'earth') {
+            soundManager.playStart();
+            startGame();
+        }
+    }
+}
+
+/**
+ * 粒子系统
+ */
+function createParticles(pos, type) {
+    const count = 15;
+    const geom = new THREE.BufferGeometry();
+    const positions = new Float32Array(count * 3);
+    const velocities = [];
+
+    let color = 0xff0000;
+    if (type === 'watermelon') color = 0xff3333;
+    if (type === 'poop') color = 0x8b4513;
+    if (type === 'bomb') color = 0xffffff;
+    if (type === 'earth') color = 0x00ffff;
+
+    for (let i = 0; i < count; i++) {
+        positions[i*3] = pos.x;
+        positions[i*3+1] = pos.y;
+        positions[i*3+2] = pos.z;
+
+        velocities.push({
+            x: (Math.random() - 0.5) * 10,
+            y: (Math.random() - 0.5) * 10,
+            z: (Math.random() - 0.5) * 10
+        });
+    }
+
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const mat = new THREE.PointsMaterial({
+        color: color,
+        size: 0.8,
+        transparent: true,
+        map: textures.explosion // 简单的复用
+    });
+
+    const sys = new THREE.Points(geom, mat);
+    scene.add(sys);
+    particles.push({ mesh: sys, vels: velocities, life: 1.0 });
+}
+
+function updateParticles(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.life -= dt * 2;
+
+        const positions = p.mesh.geometry.attributes.position.array;
+
+        for (let j = 0; j < p.vels.length; j++) {
+            positions[j*3] += p.vels[j].x * dt;
+            positions[j*3+1] += p.vels[j].y * dt;
+            positions[j*3+2] += p.vels[j].z * dt;
+        }
+        p.mesh.geometry.attributes.position.needsUpdate = true;
+        p.mesh.material.opacity = p.life;
+
+        if (p.life <= 0) {
+            scene.remove(p.mesh);
+            p.mesh.geometry.dispose();
+            p.mesh.material.dispose();
+            particles.splice(i, 1);
+        }
+    }
+}
+
+/**
+ * Three.js 初始化
+ */
+function initThree() {
+    const container = document.getElementById('game-container');
+
+    scene = new THREE.Scene();
+    // 添加一点环境光
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(0, 10, 10);
+    scene.add(dirLight);
+
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.z = 20;
+
+    renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    container.appendChild(renderer.domElement);
+
+    // 刀光 (使用 LineStrip)
+    const bladeGeom = new THREE.BufferGeometry();
+    // 预分配 50 个点的缓冲区
+    const posAttribute = new THREE.BufferAttribute(new Float32Array(50 * 3), 3);
+    posAttribute.setUsage(THREE.DynamicDrawUsage);
+    bladeGeom.setAttribute('position', posAttribute);
+
+    const bladeMat = new THREE.LineBasicMaterial({
+        color: 0x00ffff,
+        linewidth: 5, // 注意：WebGL 对 linewidth 支持有限
+        opacity: 0.8,
+        transparent: true
+    });
+    // 使用 Tube 或 Ribbon 会更好，但 Line 足够简单高效
+    window.bladeMesh = new THREE.Line(bladeGeom, bladeMat);
+    window.bladeMesh.frustumCulled = false;
+    scene.add(window.bladeMesh);
+
+    // 初始生成地球
+    resetGameToMenu();
+}
+
+/**
+ * MediaPipe Hands 初始化
+ */
+function initMediaPipe() {
+    const video = document.getElementById('pip-video');
+    const canvas = document.getElementById('pip-canvas');
+    const ctx = canvas.getContext('2d');
+
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(onResults);
+
+    const camera = new Camera(video, {
+        onFrame: async () => {
+            await hands.send({image: video});
+        },
+        width: 320,
+        height: 240
+    });
+    camera.start();
+
+    function onResults(results) {
+        // 隐藏 loading
+        document.getElementById('loading').style.display = 'none';
+
+        // 绘制 PIP 骨骼
+        ctx.save();
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.translate(canvas.width, 0);
+        ctx.scale(-1, 1); // 镜像
+        ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const landmarks = results.multiHandLandmarks[0];
+
+            // 绘制绿色骨骼
+            drawConnectors(ctx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+            drawLandmarks(ctx, landmarks, {color: '#FF0000', lineWidth: 1, radius: 3});
+
+            // 获取食指指尖 (Index 8)
+            // 坐标是归一化的 [0, 1]
+            handLandmarks = landmarks[8];
+        } else {
+            handLandmarks = null;
+        }
+        ctx.restore();
+    }
+}
+
+/**
+ * 坐标映射：将 2D 屏幕坐标 (0-1) 映射到 3D 世界坐标 (Z=0 平面)
+ */
+function getScenePosition(normalizedX, normalizedY) {
+    // MediaPipe x 是镜像的，且 0在左，1在右。
+    // 在 PIP 显示中我们做了镜像翻转，但在 3D 逻辑中，我们希望
+    // 手往右移，屏幕上的刀也往右移。
+    // normalizedX: 0(左) -> 1(右)
+
+    const vec = new THREE.Vector3();
+    const pos = new THREE.Vector3();
+
+    // 屏幕空间转换 (-1 到 1)
+    // 注意：MediaPipe 的坐标系 Y 轴向下 (0在上)，Three.js Y 轴向上
+    vec.set(
+        (1 - normalizedX) * 2 - 1, // X 反转以匹配镜像感
+        -(normalizedY * 2 - 1),    // Y 反转
+        0.5
+    );
+
+    vec.unproject(camera);
+    vec.sub(camera.position).normalize();
+
+    const distance = (CONFIG.zPlane - camera.position.z) / vec.z;
+    pos.copy(camera.position).add(vec.multiplyScalar(distance));
+    return pos;
+}
+
+/**
+ * 游戏逻辑控制
+ */
+function startGame() {
+    gameState = 'PLAYING';
+    score = 0;
+    lives = 3;
+    updateUI();
+
+    // 清除菜单物体
+    gameObjects.forEach(o => o.remove());
+    gameObjects = [];
+
+    msgEl.style.opacity = 0;
+}
+
+function endGame() {
+    gameState = 'GAMEOVER';
+    msgEl.innerHTML = `
+        <h1 class="text-red-500 mb-4">游戏结束</h1>
+        <p class="text-2xl">最终得分: ${score}</p>
+        <p class="text-sm mt-4 blink">等待重置...</p>
+    `;
+    msgEl.style.opacity = 1;
+
+    setTimeout(() => {
+        resetGameToMenu();
+    }, 3000);
+}
+
+function resetGameToMenu() {
+    gameState = 'MENU';
+    gameObjects.forEach(o => o.remove());
+    gameObjects = [];
+
+    // 生成地球
+    gameObjects.push(new GameObject('earth'));
+
+    msgEl.innerHTML = `
+        <h1 class="mb-4">手势切水果</h1>
+        <p class="text-xl blink">请举起食指，切开地球开始游戏</p>
+    `;
+    msgEl.style.opacity = 1;
+}
+
+function updateUI() {
+    scoreEl.innerText = `得分: ${score}`;
+    let hearts = "";
+    for(let i=0; i<lives; i++) hearts += "❤️ ";
+    livesEl.innerText = hearts;
+}
+
+/**
+ * 主循环
+ */
+const clock = new THREE.Clock();
+
+function animate() {
+    requestAnimationFrame(animate);
+    const dt = clock.getDelta();
+    const time = clock.getElapsedTime();
+
+    // 1. 更新刀光
+    if (handLandmarks) {
+        const p = getScenePosition(handLandmarks.x, handLandmarks.y);
+
+        // 只有当手移动速度够快时才产生切割判定 (简单的防误触，或者直接判定)
+        // 这里简单处理：只要追踪到就更新
+        bladeTrail.unshift(p.clone());
+
+        // 音效触发：如果移动距离大，播放挥舞声
+        if (bladeTrail.length > 1) {
+            const dist = bladeTrail[0].distanceTo(bladeTrail[1]);
+            if (dist > 1.5) {
+                // 限流播放
+                if (Math.random() > 0.8) soundManager.playSwoosh();
+            }
+        }
+    }
+
+    // 截断轨迹
+    if (bladeTrail.length > 10) bladeTrail.pop();
+
+    // 更新 Mesh 顶点
+    const positions = window.bladeMesh.geometry.attributes.position.array;
+    for (let i = 0; i < 50; i++) {
+        if (i < bladeTrail.length) {
+            positions[i*3] = bladeTrail[i].x;
+            positions[i*3+1] = bladeTrail[i].y;
+            positions[i*3+2] = bladeTrail[i].z;
+        } else {
+            // 将剩余点折叠到最后一个点，隐藏
+            const last = bladeTrail[bladeTrail.length - 1] || new THREE.Vector3(0,-100,0);
+            positions[i*3] = last.x;
+            positions[i*3+1] = last.y;
+            positions[i*3+2] = last.z;
+        }
+    }
+    window.bladeMesh.geometry.attributes.position.needsUpdate = true;
+
+    // 2. 生成物体 logic
+    if (gameState === 'PLAYING') {
+        if (time - lastSpawnTime > CONFIG.spawnRate) {
+            lastSpawnTime = time;
+            // 随机生成
+            const r = Math.random();
+            let type = 'watermelon';
+            if (r > 0.8) type = 'bomb';
+            else if (r > 0.6) type = 'poop';
+
+            gameObjects.push(new GameObject(type));
+
+            // 随着分数增加，生成加快
+            if (CONFIG.spawnRate > 0.6) CONFIG.spawnRate -= 0.01;
+        }
+    }
+
+    // 3. 更新物体与碰撞检测
+    // 取刀光的前两个点作为切割线段
+    const bladeTip = bladeTrail[0];
+
+    for (let i = gameObjects.length - 1; i >= 0; i--) {
+        const obj = gameObjects[i];
+        obj.update(dt);
+
+        if (obj.active && bladeTip) {
+            // 简单距离检测 (半径检测)
+            const dist = bladeTip.distanceTo(obj.mesh.position);
+            if (dist < obj.radius) {
+                obj.slice();
+            }
+        }
+    }
+
+    // 4. 更新粒子
+    updateParticles(dt);
+
+    renderer.render(scene, camera);
+}
+
+// 初始化
+soundManager = new SoundManager();
+initThree();
+initMediaPipe();
+animate();
+
+// 窗口调整
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// 点击解锁 AudioContext (浏览器策略)
+window.addEventListener('click', () => {
+    if (soundManager.ctx.state === 'suspended') {
+        soundManager.ctx.resume();
+    }
+}, {once:true});
+
+</script>
+</body>
+</html>
